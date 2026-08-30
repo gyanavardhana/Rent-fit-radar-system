@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local env files (VITE_MAPPLS_TOKEN etc.) — keep tokens out of git
+.env
+.env.*
+!.env.example
