@@ -1,6 +1,8 @@
 import { useState } from 'react'
 import type { FormEvent } from 'react'
 import { getRecommendations } from './api'
+import { LocalityMap } from './LocalityMap'
+import { PlaceAutosuggest } from './PlaceAutosuggest'
 import type { Preferences, RankedLocality, Recommendation } from './types'
 import './App.css'
 
@@ -56,7 +58,13 @@ function App() {
       <div className="step-label">01 <span>Your search</span></div>
       <form onSubmit={handleSubmit}>
         <div className="form-grid top-fields">
-          <label><span>Where do you need to be?</span><input value={preferences.anchor} onChange={(event) => setPreferences({ ...preferences, anchor: event.target.value })} placeholder="e.g. Manyata Tech Park" required /></label>
+          <label><span>Where do you need to be?</span><PlaceAutosuggest
+            value={preferences.anchor}
+            onChange={(anchor) => setPreferences((current) => ({ ...current, anchor, anchorPlace: undefined }))}
+            onSelect={(anchorPlace) => setPreferences((current) => ({ ...current, anchor: anchorPlace.name, anchorPlace }))}
+            placeholder="e.g. Manyata Tech Park"
+            required
+          /></label>
           <label><span>Search radius</span><select value={preferences.radiusKm} onChange={(event) => setPreferences({ ...preferences, radiusKm: Number(event.target.value) })}><option value={3}>Within 3 km</option><option value={5}>Within 5 km</option><option value={8}>Within 8 km</option><option value={12}>Within 12 km</option></select></label>
         </div>
         <div className="form-grid">
@@ -91,7 +99,7 @@ function App() {
       <div className="result-layout">
         <div className="rank-list">{recommendation.rankedLocalities.map((locality) => <button className={selectedLocality.locality === locality.locality ? 'locality-row selected' : 'locality-row'} key={locality.locality} onClick={() => setSelectedLocality(locality)}><span className="rank">0{locality.rank}</span><span className="locality-name">{locality.locality}<small>{locality.whyItFits}</small></span><span className="score">{locality.fitScore}<small>fit</small></span></button>)}</div>
         <article className="detail-card">
-          <div className="detail-visual"><div className="map-grid"><span className="road road-one" /><span className="road road-two" /><span className="map-pin">⌖</span></div><div className="score-orb"><strong>{selectedLocality.fitScore}</strong><span>FIT SCORE</span></div><p>{selectedLocality.locality} <span>•</span> Best overall match</p></div>
+          <LocalityMap anchor={recommendation.anchor} localities={recommendation.rankedLocalities} selected={selectedLocality} onSelect={setSelectedLocality} overlay={<div className="map-badge"><div className="score-orb"><strong>{selectedLocality.fitScore}</strong><span>FIT SCORE</span></div><p className="map-caption">{selectedLocality.locality} <span>•</span> {selectedLocality.rank === 1 ? 'Best overall match' : `Ranked #${selectedLocality.rank}`}</p></div>} />
           <div className="detail-body">
             <div className="label-row"><span className="best-match">Best match</span><span>Live data</span></div>
             <h3>{selectedLocality.locality}</h3>
