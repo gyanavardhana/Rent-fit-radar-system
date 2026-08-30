@@ -28,9 +28,13 @@ app.use(
 );
 
 import { createRecommendationController } from "./controllers/recommendation.controller.js";
+import { createRecommendationRoutes } from "./routes/recommendation.routes.js";
 const recommendationController = createRecommendationController(anakin);
 
-app.post("/api/recommendations", recommendationController.getRecommendations);
+app.use(
+  "/api/recommendations",
+  createRecommendationRoutes(recommendationController)
+);
 
 app.use((error, req, res, next) => {
   console.error(error);

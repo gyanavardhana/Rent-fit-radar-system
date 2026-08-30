@@ -1,92 +1,162 @@
-import { normalizeListing } from "../utils/normalize.js";
+import { logger } from "../utils/logger.js";
+
+/**
+ * Try to extract a rent number from a text snippet.
+ * Looks for patterns like ₹15,000 / Rs 15000 / 15k / 15,000/month
+ */
+function extractRent(text = '') {
+  const patterns = [
+    /₹\s*([\d,]+)/,
+    /Rs\.?\s*([\d,]+)/i,
+    /([\d,]+)\s*\/?\s*month/i,
+    /([\d]+)k\b/i,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) {
+      let val = m[1].replace(/,/g, '');
+      if (re.toString().includes('k')) val = String(Number(val) * 1000);
+      const n = Number(val);
+      if (n > 1000 && n < 500000) return n;
+    }
+  }
+  return null;
+}
+
+/**
+ * Try to detect a known Bengaluru locality from text.
+ */
+const LOCALITIES = [
+  'Thanisandra', 'Hebbal', 'Hennur', 'Nagavara', 'Nagawara',
+  'HBR Layout', 'Yelahanka', 'Ramamurthy Nagar', 'Kalyan Nagar',
+  'Banaswadi', 'Whitefield', 'Marathahalli', 'HSR Layout', 'Koramangala',
+  'Indiranagar', 'BTM Layout', 'Jayanagar', 'JP Nagar', 'Electronic City',
+  'Sarjapur', 'Bellandur', 'KR Puram', 'Hoodi', 'Mahadevapura',
+];
+
+function detectLocality(text = '', anchor = '') {
+  const lower = text.toLowerCase();
+  for (const loc of LOCALITIES) {
+    if (lower.includes(loc.toLowerCase())) return loc;
+  }
+  return anchor;
+}
+
+function detectSource(url = '') {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    if (h.includes('nobroker')) return 'NoBroker';
+    if (h.includes('99acres')) return '99acres';
+    if (h.includes('housing')) return 'Housing.com';
+    if (h.includes('magicbricks')) return 'MagicBricks';
+    return h.replace('www.', '');
+  } catch { return 'Unknown'; }
+}
 
 export function createRecommendationController(anakinAdapter) {
   return {
     getRecommendations: async (req, res, next) => {
       try {
         const prefs = req.body;
-        console.log(`[Backend] recommendation request received for anchor: ${prefs.anchor}`);
-        
+        console.log(`[Backend] recommendation request for anchor: ${prefs.anchor}`);
+
         const homeTypeMatch = (prefs.homeType || '2 BHK').match(/\d/);
         const bhk = homeTypeMatch ? homeTypeMatch[0] : '2';
-        
-        // Build NoBroker URL
-        const city = "bangalore";
-        const noBrokerUrl = `https://www.nobroker.in/property/rent/${city}/${encodeURIComponent(prefs.anchor)}?locality=${encodeURIComponent(prefs.anchor)}&type=BHK${bhk}`;
-        
-        console.log(`[Anakin] live search executed for URL: ${noBrokerUrl}`);
+        const budgetLimit = prefs.budgetMax || 30000;
 
-        let scrapeResult;
+        const prompt = `Find ${bhk} BHK rental flats near ${prefs.anchor}, Bengaluru under ₹${budgetLimit}/month. 
+Show current listings from NoBroker, 99acres, MagicBricks. Include rent price, locality name, and listing URL.`;
+
+        console.log(`[Anakin] searching for: ${prefs.anchor}`);
+        logger.info(`Search started: anchor=${prefs.anchor}, budget=${budgetLimit}, bhk=${bhk}`);
+
+        let searchResponse;
         try {
-          scrapeResult = await anakinAdapter.scrapeListing(noBrokerUrl);
+          searchResponse = await anakinAdapter.searchRentals(prompt, 20);
         } catch (e) {
-          console.error(`Anakin scrape failed:`, e.message);
+          console.error(`Anakin search failed:`, e.message);
+          logger.error(`Anakin search failed: ${e.message}`);
           return res.status(503).json({
             success: false,
-            error: "Live rental data is temporarily unavailable."
+            error: "Live rental data is temporarily unavailable. Please try again in a moment."
           });
         }
-        
-        // Ensure data exists
-        const data = scrapeResult?.data;
-        if (!data || !data.listings || data.listings.length === 0) {
-          return res.status(500).json({
-            success: false,
-            error: "No matches found in live data."
-          });
-        }
-        
-        console.log(`[Anakin] real sources returned: ${data.listings.length}`);
 
-        // Normalize listings
-        const normalized = data.listings.map(l => normalizeListing(l));
-        console.log(`[Normalizer] rental listings extracted: ${normalized.length}`);
-        
-        // Group by locality (or just use the anchor as the primary locality if all results belong to it, or parse address)
-        // NoBroker returns properties in and around the locality. 
-        // We will identify unique localities from the addresses
-        const localities = {};
-        for (const list of normalized) {
-          // Extract locality from title or address
-          let locName = list.location.locality || prefs.anchor;
-          if (list.title.toLowerCase().includes("thanisandra")) locName = "Thanisandra";
-          else if (list.title.toLowerCase().includes("hebbal")) locName = "Hebbal";
-          else if (list.title.toLowerCase().includes("hennur")) locName = "Hennur";
-          else if (list.title.toLowerCase().includes("nagavara") || list.title.toLowerCase().includes("nagawara")) locName = "Nagavara";
-          else if (list.title.toLowerCase().includes("hbr layout")) locName = "HBR Layout";
-          
-          if (!localities[locName]) {
-            localities[locName] = [];
-          }
-          localities[locName].push(list);
+        logger.info(`RAW response keys: ${Object.keys(searchResponse || {}).join(', ')}`);
+        logger.info(`RAW response: ${JSON.stringify(searchResponse).slice(0, 3000)}`);
+
+        // Anakin search returns: { id, results: [{ title, url, snippet, date }] }
+        const rawResults = searchResponse?.results
+          ?? (Array.isArray(searchResponse) ? searchResponse : []);
+
+        logger.info(`Raw results count: ${rawResults.length}`);
+        console.log(`[Anakin] ${rawResults.length} search results returned`);
+
+        if (rawResults.length === 0) {
+          return res.json({
+            winner: null,
+            rankedLocalities: [],
+            explanation: "No live rental data found for this location and budget.",
+            language: prefs.language || "en-IN",
+            generatedAt: new Date().toISOString()
+          });
         }
-        
-        const candidates = Object.keys(localities).map(locName => {
-          const props = localities[locName];
-          const rents = props.map(p => p.pricing.rent).filter(r => r !== null);
+
+        // Parse each search result snippet into a structured listing
+        const parsedListings = rawResults
+          .map(r => {
+            const text = `${r.title || ''} ${r.snippet || ''}`;
+            const rent = extractRent(text);
+            const locality = detectLocality(text, prefs.anchor);
+            const source = detectSource(r.url || '');
+            return { title: r.title, url: r.url, snippet: r.snippet, rent, locality, source };
+          })
+          .filter(l => l.title && l.url); // must have at least title + URL
+
+        logger.info(`Parsed ${parsedListings.length} structured listings`);
+        console.log(`[Normalizer] ${parsedListings.length} listings after parsing`);
+
+        if (parsedListings.length === 0) {
+          return res.json({
+            winner: null,
+            rankedLocalities: [],
+            explanation: "Live search completed but no structured listings could be extracted.",
+            language: prefs.language || "en-IN",
+            generatedAt: new Date().toISOString()
+          });
+        }
+
+        // Group by locality
+        const localityMap = {};
+        for (const l of parsedListings) {
+          if (!localityMap[l.locality]) localityMap[l.locality] = [];
+          localityMap[l.locality].push(l);
+        }
+
+        const candidates = Object.keys(localityMap).map(locName => {
+          const props = localityMap[locName];
+          const rents = props.map(p => p.rent).filter(r => r !== null);
           const minRent = rents.length > 0 ? Math.min(...rents) : null;
           const maxRent = rents.length > 0 ? Math.max(...rents) : null;
           const avgRent = rents.length > 0 ? rents.reduce((a, b) => a + b, 0) / rents.length : null;
-          
-          const budgetLimit = prefs.budgetMax || 30000;
-          let budgetScore = 100;
+
+          let budgetScore = 80; // default when no rent data
           let budgetLabel = "Strong";
-          
           if (avgRent) {
-            if (avgRent > budgetLimit * 1.2) { budgetScore = 40; budgetLabel = "Weak"; }
-            else if (avgRent > budgetLimit) { budgetScore = 70; budgetLabel = "Mixed"; }
+            if (avgRent > budgetLimit * 1.2)      { budgetScore = 40; budgetLabel = "Weak"; }
+            else if (avgRent > budgetLimit)        { budgetScore = 70; budgetLabel = "Mixed"; }
             else if (avgRent <= budgetLimit * 0.8) { budgetScore = 95; budgetLabel = "Strong"; }
-            else { budgetScore = 85; budgetLabel = "Good"; }
+            else                                   { budgetScore = 85; budgetLabel = "Good"; }
           }
-          
-          const rentContext = minRent && maxRent 
-            ? `Observed ${bhk}BHK listings around ₹${(minRent/1000).toFixed(0)}k–₹${(maxRent/1000).toFixed(0)}k` 
-            : `Live listings found in ${locName}`;
-            
+
+          const rentContext = minRent && maxRent
+            ? `Observed ${bhk}BHK listings around ₹${(minRent/1000).toFixed(0)}k–₹${(maxRent/1000).toFixed(0)}k`
+            : `Live listings found near ${locName}`;
+
           const sources = props.slice(0, 3).map(p => ({
-            title: p.title || "Real Estate Listing",
-            url: p.listingUrl || p.source?.url || noBrokerUrl,
-            snippet: `Rent: ₹${p.pricing.rent} | Deposit: ₹${p.pricing.deposit} | ${p.property.bedrooms} BHK`
+            title: (p.title || 'Rental Listing').slice(0, 80),
+            url: p.url,
+            snippet: p.snippet?.slice(0, 120) || `${bhk} BHK in ${locName}`
           }));
 
           return {
@@ -94,13 +164,15 @@ export function createRecommendationController(anakinAdapter) {
             fitScore: budgetScore,
             labels: {
               budget: budgetLabel,
-              commute: "Strong", // Commute can be mocked or calculated later
+              commute: "Strong",
               essentials: "Strong"
             },
-            whyItFits: `Based on live scraped evidence, this locality has ${props.length} available properties matching your search.`,
-            tradeOff: avgRent > budgetLimit ? "Average rent exceeds your preferred ceiling." : "Verify individual properties before confirming.",
-            rentContext: rentContext,
-            sources: sources,
+            whyItFits: `Found ${props.length} live ${bhk}BHK listing(s) near ${locName} from ${[...new Set(props.map(p => p.source))].join(', ')}.`,
+            tradeOff: avgRent > budgetLimit
+              ? "Average observed rent exceeds your preferred ceiling."
+              : "Verify individual properties directly before committing.",
+            rentContext,
+            sources,
             spatial: {
               mapsUri: `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(locName + ', Bengaluru')}`,
               nearby: [
@@ -116,23 +188,21 @@ export function createRecommendationController(anakinAdapter) {
           };
         });
 
-        // Sort by fit score
         candidates.sort((a, b) => b.fitScore - a.fitScore);
-        
-        // Take top 3
-        const topCandidates = candidates.slice(0, 3);
-        const rankedLocalities = topCandidates.map((c, i) => ({ ...c, rank: i + 1 }));
+        const rankedLocalities = candidates.slice(0, 3).map((c, i) => ({ ...c, rank: i + 1 }));
 
-        console.log(`[Scorer] recommendations generated: ${rankedLocalities.length}`);
+        console.log(`[Scorer] ${rankedLocalities.length} ranked localities`);
+        logger.info(`Returning ${rankedLocalities.length} ranked localities`);
 
         res.json({
           winner: rankedLocalities[0],
           rankedLocalities,
-          explanation: `We searched live rental data from NoBroker. ${rankedLocalities[0]?.locality} is your best fit based on live pricing.`,
+          explanation: `Searched live web for ${bhk}BHK rentals near ${prefs.anchor}. ${rankedLocalities[0]?.locality ?? prefs.anchor} is your best match based on current listings.`,
           language: prefs.language || "en-IN",
           generatedAt: new Date().toISOString()
         });
       } catch (error) {
+        logger.error(`Unhandled error: ${error.message}`);
         next(error);
       }
     }
