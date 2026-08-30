@@ -15,6 +15,7 @@ export type RankedLocality = {
   labels: { budget: 'Strong' | 'Good' | 'Mixed' | 'Weak'; commute: 'Strong' | 'Good' | 'Mixed' | 'Weak'; essentials: 'Strong' | 'Good' | 'Mixed' | 'Weak' }
   whyItFits: string
   tradeOff: string
+  rentContext?: string
   sources: Array<{ title: string; url: string; snippet: string }>
   spatial?: { mapsUri: string; nearby: Array<{ category: string; count: number }>; commute?: { mode: string; durationMinutes: number; observedAt: string } }
 }
