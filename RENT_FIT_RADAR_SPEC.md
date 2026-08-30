@@ -2,14 +2,14 @@
 
 ## One-line pitch
 
-Rent Fit Radar helps Bengaluru renters decide **which locality fits them best** by balancing rental budget, home type, commute needs, and nearby essentials. It uses live web evidence and explains the trade-offs in the renter's chosen Indian language, with optional voice playback.
+Rent Fit Radar helps Bengaluru renters decide **which locality fits them best** by balancing rental budget, home type, commute needs, and nearby essentials. It uses live web evidence, explains the trade-offs in the renter's chosen Indian language, and can bridge a consented renter-owner conversation across languages.
 
 ## Challenge fit
 
 - **Real user:** a renter choosing among Bengaluru localities.
 - **Clear input:** commute anchor, radius, flat type, budget, priorities, and answer language.
 - **Useful output:** three ranked localities, a clear winner, source links, a commute snapshot, nearby-essentials signals, and a short local-language explanation.
-- **Sarvam.ai:** translates the recommendation and creates the optional audio answer.
+- **Sarvam.ai:** translates and voices the recommendation, then powers an optional bilingual renter-owner conversation.
 - **Anakin.io:** searches and/or scrapes current rental-context and qualitative locality information.
 - **Google Maps Platform:** supplies bounded, source-linked spatial evidence: nearby essentials, a representative locality visual, and a commute snapshot.
 
@@ -27,6 +27,8 @@ Given a renter's preferences, return three nearby Bengaluru localities and answe
 4. Which live sources support the recommendation?
 
 The product recommends **localities**, not individual apartments. It gives planning guidance, not guaranteed availability or exact rents. A commute is a time-stamped estimate, not a promise of future traffic.
+
+The optional conversation feature is a post-recommendation hand-off. It does not source, scrape, or publicly expose a person’s mobile number. A real owner or agent contact must come from a verified, consented listing source.
 
 ## Target demo scenario
 
@@ -100,6 +102,19 @@ Evidence section:
 - Two or three source cards per locality, showing title, domain, and link
 - A short `Why this ranked here` expansion with the factors used
 - Disclaimer: `Rent and commute information are indicative; verify listings and routes before deciding.`
+
+### Bilingual conversation hand-off (stretch feature)
+
+After viewing the ranked localities, a renter can select **Start bilingual conversation**. For the sprint this opens a shared browser room, not a phone call:
+
+- The renter creates a one-time invite link and selects their language; the owner/agent opens it and selects theirs.
+- Both participants see a clear banner: `AI translation is active. Do not share OTPs, payment details, or other sensitive information.`
+- Each person uses a tap-to-talk button. One short turn is translated before the next begins; this avoids crosstalk and makes latency understandable.
+- The room shows the original utterance, its translation, and a replay button for the translated audio.
+- Provide quick question chips: `Is the flat available?`, `What is the deposit?`, `Can I visit this weekend?`
+- Recording and transcript saving are off by default. If either is later introduced, both participants must opt in first.
+
+For a live demo, open the renter and owner room in two browser tabs with different languages. A future verified-listing integration may show a masked contact and a `Request bilingual call` action, but raw phone numbers never appear in the locality research results.
 
 ## Recommendation logic
 
@@ -206,6 +221,17 @@ Build a short, evidence-grounded English recommendation first. Then:
 
 The UI must visibly state that the explanation and audio were created with Sarvam.
 
+### Sarvam.ai — conversation translation
+
+For each short participant turn:
+
+1. Receive microphone audio at the server.
+2. Use Sarvam speech-to-text or speech-to-text translation to obtain the original-language transcript and the recipient-language text.
+3. Use Sarvam text-to-speech to create short translated audio for the other participant.
+4. Return both texts and the translated audio to the browser room.
+
+This is an interpreter, not an autonomous rental negotiator. It must preserve the participant’s words, display the transcript for correction, and never invent availability, pricing, or commitments.
+
 ## Technical design
 
 ### Primary module
@@ -225,6 +251,22 @@ Its implementation owns candidate selection, Anakin retrieval, Google spatial re
 - `LanguageAdapter`: Sarvam translation and text-to-speech adapter; fakeable in tests.
 - `LocalityScorer`: pure function that ranks normalized Anakin and Maps evidence. It has no network access and never consumes image pixels.
 
+### Conversation module
+
+Keep live translation out of `RecommendationModule`. Create a separate deep `ConversationModule` with one external interface:
+
+```ts
+translateTurn(input: ConversationTurn): Promise<TranslatedTurn>;
+```
+
+Its implementation validates a short audio turn, calls Sarvam STT/translation/TTS, associates it with the room and intended recipient language, and returns display-ready transcript, translation, and audio. It does not store recordings by default.
+
+Internal seams:
+
+- `SpeechTranslationAdapter`: Sarvam STT and translation adapter; fakeable in tests.
+- `ConversationSpeechAdapter`: Sarvam TTS adapter; fakeable in tests.
+- `ConversationStore`: one-time room/invite state; use an in-memory implementation for the demo and expire rooms quickly.
+
 ### Server route
 
 `POST /api/recommendations`
@@ -233,6 +275,14 @@ Its implementation owns candidate selection, Anakin retrieval, Google spatial re
 - Calls `RecommendationModule.getRecommendation`.
 - Returns the ranked recommendation with sources and optional audio.
 - Never exposes `ANAKIN_API_KEY`, `SARVAM_API_KEY`, or server-side Google Maps credentials to the client.
+
+### Conversation routes
+
+- `POST /api/conversations`: creates a short-lived, one-time invite after the renter accepts the AI-translation notice.
+- `POST /api/conversations/:id/join`: records the second participant’s language and consent.
+- `POST /api/conversations/:id/turn`: accepts one bounded audio turn and returns the transcript, translation, and translated audio.
+
+Reject turns until both participants have joined and accepted the notice. Apply rate limits, validate the room token, and expire the room and its transient transcript after the demo session.
 
 ## Result model
 
@@ -265,6 +315,20 @@ type Recommendation = {
   audio?: { mimeType: string; url: string };
   generatedAt: string;
 };
+
+type ConversationTurn = {
+  conversationId: string;
+  speaker: "renter" | "owner";
+  sourceLanguage: "en-IN" | "hi-IN" | "kn-IN";
+  targetLanguage: "en-IN" | "hi-IN" | "kn-IN";
+  audio: { mimeType: string; data: string };
+};
+
+type TranslatedTurn = {
+  originalText: string;
+  translatedText: string;
+  audio: { mimeType: string; data: string };
+};
 ```
 
 ## Error and fallback behavior
@@ -273,12 +337,15 @@ type Recommendation = {
 - Anakin failure: show a retry action and a source-aware fallback based on the fixed candidate set; label it as limited-live-data mode.
 - Google Maps failure: preserve Anakin-backed cards, mark commute and nearby counts as unavailable, and retain no stale Maps photo or estimate.
 - Sarvam translation/TTS failure: still show the English text result and explain that language audio is temporarily unavailable.
+- Conversation STT/translation/TTS failure: keep the participant's local audio unavailable for sending, show an honest retry action, and never fabricate a translated turn.
+- A conversation invite is opened by only one participant: show a waiting state and expire it quickly; do not retain its transcript after expiry.
 - No candidate fits the budget: show the three closest fits and explicitly say the budget is difficult for the chosen radius/home type.
 - API key absent: show a developer-facing configuration message locally; never leak key values.
 
 ## Non-goals for the sprint
 
 - Individual property listings or booking
+- Live PSTN phone bridging, Twilio integration, call recording, or automated landlord outreach
 - Individual listing-to-office routing, turn-by-turn navigation, or continuously monitored traffic
 - User accounts, saved searches, payments, or notifications
 - Broad citywide coverage outside the curated Bengaluru candidate set
@@ -290,7 +357,7 @@ type Recommendation = {
 2. **Next 20 minutes:** implement fixed candidate selection, Anakin evidence normalization, the pure scorer, and a JSON result card.
 3. **Next 20 minutes:** add the bounded Google Places/Routes adapter: three route estimates and selected POI counts; log its normalized output.
 4. **Next 20 minutes:** build the wizard, ranked locality cards, source links, map deep links, loading steps, and error states.
-5. **Final 10 minutes:** add translation/TTS, one lazy-loaded visual per card if time permits, test the demo scenario, and prepare a fallback example.
+5. **Final 10 minutes:** add translation/TTS and test the demo scenario. Only after the core flow works, add the tap-to-talk bilingual room as a stretch feature; a single translated turn is enough for the demo.
 
 ## Demo script (two minutes)
 
@@ -299,7 +366,8 @@ type Recommendation = {
 3. Point out the live-source loading steps.
 4. Show BTM Layout as the winner, compare it with HSR Layout and Bellandur, point out the time-stamped commute and nearby-grocery evidence, then open a source or Google Maps link.
 5. Play the Kannada voice recommendation.
-6. Close with: `We do not just find houses; we help people choose the area that makes everyday life work.`
+6. Optionally open the bilingual room in a second tab; ask `Is the flat available?` in Kannada and show its Hindi transcript, translation, and spoken reply.
+7. Close with: `We do not just find houses; we help people choose the area that makes everyday life work—and help them cross the language barrier after they choose.`
 
 ## Acceptance criteria
 
@@ -309,5 +377,7 @@ type Recommendation = {
 - When Google Maps credentials are configured, the result includes bounded route/nearby evidence and source-linked Maps deep links; it still works without them.
 - The UI visibly shows source evidence and Sarvam’s translated and/or spoken output.
 - Any locality visual is clearly attributed, lazy-loaded, limited to one per card, and excluded from the ranking calculation.
+- When the stretch feature is enabled, two participants can join a consented browser room and complete a short translated turn with original text, translated text, and translated audio.
+- No mobile number is scraped, publicly exposed, or required for the browser-room demo; recordings and transcript persistence are off by default.
 - Loading, empty-result, and integration-error states are handled.
 - The demonstrated flow completes in under two minutes.
